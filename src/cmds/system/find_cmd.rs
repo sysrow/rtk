@@ -75,6 +75,39 @@ fn has_unsupported_find_flags(args: &[String]) -> bool {
         .any(|a| UNSUPPORTED_FIND_FLAGS.contains(&a.as_str()))
 }
 
+/// Resolve the system `find` binary, preferring absolute paths so we never
+/// re-invoke a PATH shim or shell wrapper named `find` (which could recurse
+/// back into RTK).
+fn native_find_path() -> &'static str {
+    for candidate in ["/usr/bin/find", "/bin/find"] {
+        if Path::new(candidate).exists() {
+            return candidate;
+        }
+    }
+    "find"
+}
+
+/// Delegate to the system `find` for queries RTK cannot represent (compound
+/// predicates and actions such as -exec, -delete, -print0, -not, -size, ...).
+/// stdio is inherited so native semantics — including NUL-separated output and
+/// -exec side effects — are preserved exactly, and the native exit code is
+/// propagated.
+fn run_native_find(args: &[String], verbose: u8) -> Result<()> {
+    let find_bin = native_find_path();
+    if verbose > 0 {
+        eprintln!("rtk find: delegating to {} {}", find_bin, args.join(" "));
+    }
+    let status = std::process::Command::new(find_bin)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to execute native find ({find_bin})"))?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => std::process::exit(code),
+        None => anyhow::bail!("native find terminated by signal"),
+    }
+}
+
 /// Parse arguments from raw args vec, supporting both native find and RTK syntax.
 ///
 /// Native find syntax: `find . -name "*.rs" -type f -maxdepth 3`
@@ -178,6 +211,14 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
 
 /// Entry point from main.rs — parses raw args then delegates to run().
 pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
+    // RTK's find is a reimplementation that only understands -name/-iname/-type/
+    // -maxdepth. For compound predicates or actions (-exec, -not, -print0, -delete,
+    // -perm, ...) we cannot reproduce native semantics, so transparently delegate to
+    // the system `find` binary instead of failing. Simple queries still flow through
+    // RTK's compact-output path below.
+    if has_unsupported_find_flags(args) {
+        return run_native_find(args, verbose);
+    }
     let parsed = parse_find_args(args)?;
     run(
         &parsed.pattern,
@@ -555,6 +596,24 @@ mod tests {
         // Simulates: rtk find *.rs src
         let result = run_from_args(&args(&["*.rs", "src"]), 0);
         assert!(result.is_ok());
+    }
+
+    // --- native-find delegation for unsupported flags ---
+
+    #[cfg(unix)]
+    #[test]
+    fn run_from_args_delegates_unsupported_flag_to_native() {
+        // -print0 is in UNSUPPORTED_FIND_FLAGS; run_from_args must delegate to the
+        // system find binary instead of erroring (the old behaviour was a hard bail).
+        let result = run_from_args(&args(&[".", "-maxdepth", "1", "-name", "*.toml", "-print0"]), 0);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_find_path_resolves_on_unix() {
+        let p = native_find_path();
+        assert!(p == "/usr/bin/find" || p == "/bin/find" || p == "find");
     }
 
     #[test]
